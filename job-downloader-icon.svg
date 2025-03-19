@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Background -->
+  <rect width="128" height="128" rx="16" fill="#6B5BD6" />
+  
+  <!-- Document base -->
+  <rect x="24" y="16" width="64" height="80" rx="4" fill="#FFFFFF" />
+  
+  <!-- Document lines -->
+  <rect x="34" y="34" width="44" height="4" rx="1" fill="#D3D3F5" />
+  <rect x="34" y="46" width="36" height="4" rx="1" fill="#D3D3F5" />
+  <rect x="34" y="58" width="40" height="4" rx="1" fill="#D3D3F5" />
+  <rect x="34" y="70" width="30" height="4" rx="1" fill="#D3D3F5" />
+  
+  <!-- Document header -->
+  <rect x="34" y="22" width="24" height="6" rx="1" fill="#6B5BD6" />
+  
+  <!-- Download circle -->
+  <circle cx="88" cy="88" r="28" fill="#4AC877" />
+  
+  <!-- Download arrow -->
+  <path d="M88 76 L88 100" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" />
+  <path d="M76 88 L88 100 L100 88" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
+</svg>
