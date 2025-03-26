@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn Job Downloader",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Download LinkedIn job descriptions as styled HTML files with one click",
   "permissions": ["activeTab", "downloads", "storage", "tabs"],
   "host_permissions": ["https://www.linkedin.com/jobs/*"],
