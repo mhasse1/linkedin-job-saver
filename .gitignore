@@ -21,6 +21,12 @@ Thumbs.db
 # Log files
 *.log
 
+# Build artifacts
+*.zip
+
+# Claude Code local config
+.claude/
+
 # Runtime data
 checksums/*
 exports/*
