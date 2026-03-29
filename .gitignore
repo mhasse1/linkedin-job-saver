@@ -28,3 +28,4 @@ exports/*
 # Don't ignore these directories themselves
 !checksums/.gitkeep
 !exports/.gitkeep
+.rushbg

@@ -1,114 +1,144 @@
 // LinkedIn Job Downloader - Background Script
 // Handles file creation and download functionality
 
-// Set up a listener for when a tab is updated
-chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
-  // Check if the URL matches a LinkedIn job page and the page has finished loading
-  if (changeInfo.status === 'complete' && tab.url && tab.url.match(/linkedin\.com\/jobs\/view\/\d+/)) {
-    console.log("LinkedIn job page detected in tab:", tabId);
-    
-    // Set badge to indicate a job is detected
-    chrome.action.setBadgeText({ text: "JOB", tabId: tabId });
-    chrome.action.setBadgeBackgroundColor({ color: "#0A66C2", tabId: tabId });
-    
-    // Store the URL for this tab (useful for popup)
-    chrome.storage.session.set({
-      [`tab_${tabId}_url`]: tab.url
-    });
+const DEBUG = false;
+const log = (...args) => { if (DEBUG) console.log('[LJD:bg]', ...args); };
+
+// HTML-escape text to prevent XSS in generated HTML
+const escapeHTML = (str) =>
+  String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+// Detect LinkedIn job pages on tab updates
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' && tab.url?.match(/linkedin\.com\/jobs\/view\/\d+/)) {
+    log('LinkedIn job page detected in tab:', tabId);
+
+    chrome.action.setBadgeText({ text: 'JOB', tabId });
+    chrome.action.setBadgeBackgroundColor({ color: '#0A66C2', tabId });
+
+    chrome.storage.session.set({ [`tab_${tabId}_url`]: tab.url });
   }
 });
 
-// Listen for messages from content script about job page detection
-chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
-  if (message.action === "jobPageDetected") {
-    console.log("Job page detection message received:", message);
-    
-    // Set badge to indicate a job is detected
+// Message handler
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'jobPageDetected') {
+    log('Job page detection message received:', message);
+
     if (sender.tab) {
-      chrome.action.setBadgeText({ text: "JOB", tabId: sender.tab.id });
-      chrome.action.setBadgeBackgroundColor({ color: "#0A66C2", tabId: sender.tab.id });
-      
-      // Store job data in tab-specific storage for the popup
+      const tabId = sender.tab.id;
+      chrome.action.setBadgeText({ text: 'JOB', tabId });
+      chrome.action.setBadgeBackgroundColor({ color: '#0A66C2', tabId });
+
       chrome.storage.session.set({
-        [`tab_${sender.tab.id}_jobData`]: {
+        [`tab_${tabId}_jobData`]: {
           jobTitle: message.jobTitle,
           companyName: message.companyName,
           url: message.url,
-          tabId: sender.tab.id
+          tabId
         }
       });
     }
-    
-    sendResponse({ success: true, message: "Job page detection acknowledged" });
+
+    sendResponse({ success: true });
   }
-  
-  if (message.action === "createAndDownloadHTML") {
-    try {
-      const jobData = message.jobData;
-      console.log("Creating HTML file for", jobData.companyName, "-", jobData.jobTitle);
-      
-      // Generate HTML content
-      const htmlContent = formatJobAsHTML(jobData);
-      
-      // Create file name
-      const fileName = sanitizeFileName(`${jobData.companyName}-${jobData.jobTitle}.html`);
-      
-      // Use data URL approach instead of Blob + URL.createObjectURL
-      const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(htmlContent);
-      
-      // Download the file using data URL
-      chrome.downloads.download({
-        url: dataUrl,
-        filename: fileName,
-        saveAs: false
-      }, function(downloadId) {
-        if (chrome.runtime.lastError) {
-          console.error("Download failed:", chrome.runtime.lastError);
-          sendResponse({
-            success: false,
-            error: chrome.runtime.lastError.message
-          });
-        } else {
-          console.log("Download started with ID:", downloadId);
-          sendResponse({
-            success: true,
-            downloadId: downloadId
-          });
-        }
-      });
-      
-      return true; // Keep the message channel open for async response
-    } catch (error) {
-      console.error("Error creating file:", error);
-      sendResponse({
-        success: false,
-        error: error.message
-      });
-    }
+
+  if (message.action === 'createAndDownloadHTML') {
+    handleCreateAndDownload(message.jobData, sendResponse);
+    return true; // keep channel open for async response
   }
-  
-  return true; // Keep the message channel open for async response
+
+  return true;
 });
 
-// Sanitize filename to avoid invalid characters
-function sanitizeFileName(name) {
-  // Remove special characters and replace spaces with hyphens
-  return name.replace(/[<>:"/\\|?*]/g, '')
-             .replace(/\s+/g, '-')
-             .substring(0, 100); // Limit length to avoid overly long filenames
-}
+// Async download handler
+const handleCreateAndDownload = async (jobData, sendResponse) => {
+  try {
+    log('Creating HTML file for', jobData.companyName, '-', jobData.jobTitle);
 
-// Create HTML file with nice styling
-function formatJobAsHTML(jobData) {
-  // Clean the HTML
+    const htmlContent = formatJobAsHTML(jobData);
+    const fileName = sanitizeFileName(`${jobData.companyName}-${jobData.jobTitle}.html`);
+    const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(htmlContent);
+
+    const downloadId = await chrome.downloads.download({
+      url: dataUrl,
+      filename: fileName,
+      saveAs: false
+    });
+
+    log('Download started with ID:', downloadId);
+    sendResponse({ success: true, downloadId });
+  } catch (error) {
+    console.error('Download failed:', error);
+    sendResponse({ success: false, error: error.message });
+  }
+};
+
+// Sanitize filename
+const sanitizeFileName = (name) =>
+  name
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, '-')
+    .substring(0, 100);
+
+// Clean and sanitize job description HTML using DOMParser
+const cleanJobDescriptionHTML = (html) => {
+  if (!html || html === 'No job description available.') {
+    return '<p>No job description available.</p>';
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  // Remove dangerous elements
+  doc.querySelectorAll('script, style, iframe, object, embed, form, input, textarea, select, button')
+    .forEach(el => el.remove());
+
+  // Strip event handler attributes and javascript: URIs
+  for (const el of doc.body.querySelectorAll('*')) {
+    for (const attr of [...el.attributes]) {
+      if (attr.name.startsWith('on') ||
+          (['href', 'src', 'action'].includes(attr.name) &&
+           attr.value.trim().toLowerCase().startsWith('javascript:'))) {
+        el.removeAttribute(attr.name);
+      }
+    }
+    // Safety for links
+    if (el.tagName === 'A') {
+      el.setAttribute('target', '_blank');
+      el.setAttribute('rel', 'noopener noreferrer');
+    }
+  }
+
+  return doc.body.innerHTML;
+};
+
+// Generate styled HTML file from job data
+const formatJobAsHTML = (jobData) => {
   const cleanDescription = cleanJobDescriptionHTML(jobData.jobDescription);
-  
-  const html = `<!DOCTYPE html>
+
+  // Escape all text fields to prevent XSS
+  const title = escapeHTML(jobData.jobTitle);
+  const company = escapeHTML(jobData.companyName);
+  const location = escapeHTML(jobData.location);
+  const posted = escapeHTML(jobData.whenPosted);
+  const applicants = escapeHTML(jobData.applicants);
+  const salary = escapeHTML(jobData.salaryRange);
+  const workType = escapeHTML(jobData.workType);
+  const jobType = escapeHTML(jobData.jobType);
+  const url = escapeHTML(jobData.url);
+  const jobId = escapeHTML(jobData.jobId);
+
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${jobData.companyName} - ${jobData.jobTitle}</title>
+  <title>${title} - ${company}</title>
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
@@ -123,22 +153,9 @@ function formatJobAsHTML(jobData) {
       padding-bottom: 20px;
       margin-bottom: 20px;
     }
-    h1 {
-      font-size: 28px;
-      margin-bottom: 5px;
-      color: #0073b1;
-    }
-    h2 {
-      font-size: 22px;
-      margin-top: 30px;
-      margin-bottom: 15px;
-      color: #0073b1;
-    }
-    .company {
-      font-size: 18px;
-      font-weight: 500;
-      color: #555;
-    }
+    h1 { font-size: 28px; margin-bottom: 5px; color: #0073b1; }
+    h2 { font-size: 22px; margin-top: 30px; margin-bottom: 15px; color: #0073b1; }
+    .company { font-size: 18px; font-weight: 500; color: #555; }
     .job-details {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -148,34 +165,17 @@ function formatJobAsHTML(jobData) {
       border-radius: 8px;
       margin-bottom: 30px;
     }
-    .detail-item {
-      margin-bottom: 10px;
-    }
-    .detail-label {
-      font-weight: 600;
-      color: #555;
-    }
+    .detail-item { margin-bottom: 10px; }
+    .detail-label { font-weight: 600; color: #555; }
     .job-description {
       background-color: white;
       padding: 20px;
       border-radius: 8px;
       border: 1px solid #eaeaea;
     }
-    .job-description ul, .job-description ol {
-      padding-left: 25px;
-    }
-    a {
-      color: #0073b1;
-      text-decoration: none;
-    }
-    a:hover {
-      text-decoration: underline;
-    }
-    .highlight {
-      background-color: #e7f3ff;
-      padding: 2px 5px;
-      border-radius: 3px;
-    }
+    .job-description ul, .job-description ol { padding-left: 25px; }
+    a { color: #0073b1; text-decoration: none; }
+    a:hover { text-decoration: underline; }
     footer {
       margin-top: 30px;
       text-align: center;
@@ -188,79 +188,53 @@ function formatJobAsHTML(jobData) {
 </head>
 <body>
   <header>
-    <h1>${jobData.jobTitle}</h1>
-    <div class="company">${jobData.companyName}</div>
+    <h1>${title}</h1>
+    <div class="company">${company}</div>
   </header>
-  
+
   <div class="job-details">
     <div class="detail-item">
       <div class="detail-label">Location</div>
-      <div>${jobData.location}</div>
+      <div>${location}</div>
     </div>
-    
     <div class="detail-item">
       <div class="detail-label">Posted</div>
-      <div>${jobData.whenPosted}</div>
+      <div>${posted}</div>
     </div>
-    
     <div class="detail-item">
       <div class="detail-label">Applicants</div>
-      <div>${jobData.applicants}</div>
+      <div>${applicants}</div>
     </div>
-    
     <div class="detail-item">
       <div class="detail-label">Salary</div>
-      <div>${jobData.salaryRange}</div>
+      <div>${salary}</div>
     </div>
-    
     <div class="detail-item">
       <div class="detail-label">Work Type</div>
-      <div>${jobData.workType}</div>
+      <div>${workType}</div>
     </div>
-    
     <div class="detail-item">
       <div class="detail-label">Job Type</div>
-      <div>${jobData.jobType}</div>
+      <div>${jobType}</div>
     </div>
-    
     <div class="detail-item">
       <div class="detail-label">Source</div>
-      <div><a href="${jobData.url}" target="_blank">LinkedIn Job Listing</a></div>
+      <div><a href="${url}" target="_blank">LinkedIn Job Listing</a></div>
     </div>
-    
     <div class="detail-item">
       <div class="detail-label">Job ID</div>
-      <div>${jobData.jobId}</div>
+      <div>${jobId}</div>
     </div>
   </div>
-  
+
   <h2>Job Description</h2>
   <div class="job-description">
     ${cleanDescription}
   </div>
-  
+
   <footer>
     Downloaded on ${new Date().toLocaleString()} using LinkedIn Job Downloader
   </footer>
 </body>
 </html>`;
-  
-  return html;
-}
-
-// Clean and improve the job description HTML
-function cleanJobDescriptionHTML(html) {
-  if (!html || html === "No job description available.") {
-    return "<p>No job description available.</p>";
-  }
-  
-  // Basic cleaning with regex
-  return html
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
-    .replace(/onclick="[^"]*"/gi, '')
-    .replace(/onload="[^"]*"/gi, '')
-    .replace(/onerror="[^"]*"/gi, '')
-    .replace(/(href|src)="javascript:[^"]*"/gi, '$1="#"')
-    .replace(/<a\s+/gi, '<a target="_blank" rel="noopener noreferrer" ');
-}
+};

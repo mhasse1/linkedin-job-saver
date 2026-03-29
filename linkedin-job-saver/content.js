@@ -1,86 +1,372 @@
 // LinkedIn Job Downloader - Content Script
-// This script runs on LinkedIn job pages and extracts job details
+// Extracts job details from LinkedIn job pages
 
-(function() {
-  console.log("LinkedIn Job Downloader initialized");
-  
-  // Create and inject floating download button
-  injectDownloadButton();
-  
-  // Notify the extension that we're on a job page
-  chrome.runtime.sendMessage({
-    action: "jobPageDetected",
-    jobTitle: getJobTitle(),
-    companyName: getCompanyName(),
-    url: window.location.href
-  });
-  
-  // Check if the see more button is present and click it
-  setTimeout(function() {
-    try {
-      clickSeeMoreButton();
-      
-      // Reinject the button after clicking "See more" to ensure it's visible
-      setTimeout(function() {
-        injectDownloadButton();
-      }, 1000);
-    } catch (e) {
-      console.log("Could not click 'See more' button:", e);
+const DEBUG = false;
+const log = (...args) => { if (DEBUG) console.log('[LJD:cs]', ...args); };
+
+// ---------------------------------------------------------------------------
+// Selector Configuration
+// ---------------------------------------------------------------------------
+// Centralized selectors make it easy to update when LinkedIn changes their DOM.
+// Uses partial class matching, aria attributes, data-tracking attributes, and
+// structural patterns for resilience against class name renames.
+
+const SELECTORS = {
+  jobTitle: {
+    css: [
+      'h1[class*="job-title"]',
+      'h1[class*="top-card"] a',
+      '.topcard__title',
+      'h1.t-24',
+      'h1'
+    ],
+    default: 'Unknown Position'
+  },
+
+  companyName: {
+    css: [
+      'a[class*="company-name"]',
+      'div[class*="company-name"] a',
+      'a[data-tracking-control-name*="company"]',
+      '.topcard__org-name-link',
+      'a[href*="/company/"]'
+    ],
+    filter: (el) => el.textContent.trim().length > 0 && el.textContent.trim().length < 100,
+    default: 'Unknown Company'
+  },
+
+  infoLine: {
+    css: [
+      'div[class*="primary-description"]',
+      'div[class*="subtitle-primary"]',
+      '.job-card-container__primary-description'
+    ]
+  },
+
+  insightLine: {
+    css: [
+      'div[class*="job-insight"]',
+      'li[class*="job-insight"]',
+      'div[class*="workplace-type"]'
+    ]
+  },
+
+  jobDescription: {
+    css: [
+      'div[class*="jobs-description__content"]',
+      'div[class*="jobs-description-content"]',
+      '#job-details',
+      'div[class*="jobs-box__html-content"]',
+      '.description__text'
+    ]
+  },
+
+  seeMoreButton: {
+    css: [
+      'button[aria-label*="see more" i]',
+      'button[aria-label*="show more" i]',
+      'button[class*="jobs-description__footer-button"]',
+      'button[class*="show-more-less-html__button--more"]'
+    ]
+  },
+
+  // Individual fallback selectors for location, posting time, applicants
+  location: {
+    css: [
+      'span[class*="bullet"]',
+      'span[class*="workplace-type"]',
+      '.topcard__flavor'
+    ]
+  },
+
+  postingTime: {
+    css: [
+      'span[class*="posted-date"]',
+      'span[class*="posted-time"]',
+      '.posted-time',
+      '.topcard__flavor--metadata'
+    ]
+  },
+
+  applicants: {
+    css: [
+      'span[class*="applicant-count"]',
+      'span.num-applicants'
+    ]
+  },
+
+  salary: {
+    css: [
+      'span[class*="job-insight"] span',
+      'div[class*="job-insight"] span',
+      '.salary-information',
+      '.compensation'
+    ]
+  },
+
+  workType: {
+    css: [
+      'span[class*="workplace-type"]',
+      'span[data-tracking-control-name="workplace_type"]'
+    ]
+  },
+
+  jobType: {
+    css: [
+      'span[class*="job-type"]',
+      'span[data-tracking-control-name="job_type"]'
+    ]
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Generic extraction engine
+// ---------------------------------------------------------------------------
+
+/**
+ * Try CSS selectors in order, return first matching text content.
+ * Optional filter function to validate candidate elements.
+ */
+const extractField = (config, defaultValue = 'Not specified') => {
+  for (const selector of config.css) {
+    const el = document.querySelector(selector);
+    if (el?.textContent.trim()) {
+      if (config.filter && !config.filter(el)) continue;
+      return el.textContent.trim();
     }
-  }, 2000);
-  
-  // Listen for messages from popup or background
-  chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
-    console.log("Content script received message:", request.action);
-    
-    // Handle ping messages to check if content script is ready
-    if (request.action === "ping") {
-      console.log("Ping received, sending pong");
-      sendResponse({ pong: true });
+  }
+  return config.default ?? defaultValue;
+};
+
+/**
+ * Try CSS selectors, return the element itself (not text).
+ */
+const extractElement = (config) => {
+  for (const selector of config.css) {
+    const el = document.querySelector(selector);
+    if (el) return el;
+  }
+  return null;
+};
+
+/**
+ * Scan all elements of a given tag for text matching a predicate.
+ */
+const scanByText = (tag, predicate, maxLength = 70) => {
+  for (const el of document.querySelectorAll(tag)) {
+    const text = el.textContent.trim();
+    if (text && text.length < maxLength && predicate(text.toLowerCase())) {
+      return text;
     }
-    else if (request.action === "getJobDetails") {
-      // Basic job details for popup display
-      const jobTitle = getJobTitle();
-      const companyName = getCompanyName();
-      
-      console.log("Sending job details:", jobTitle, companyName);
-      sendResponse({
-        success: true,
-        jobTitle: jobTitle,
-        companyName: companyName
-      });
-    } 
-    else if (request.action === "downloadJob") {
-      try {
-        // Extract all job details
-        const jobData = extractJobData();
-        console.log("Job data extracted:", jobData);
-        
-        sendResponse({
-          success: true,
-          jobData: jobData
-        });
-      } catch (error) {
-        console.error("Error extracting job data:", error);
-        sendResponse({
-          success: false,
-          error: error.message
-        });
+  }
+  return null;
+};
+
+// ---------------------------------------------------------------------------
+// Data extraction
+// ---------------------------------------------------------------------------
+
+const getJobTitle = () => extractField(SELECTORS.jobTitle);
+
+const getCompanyName = () => extractField(SELECTORS.companyName);
+
+const getJobId = () => {
+  const match = window.location.href.match(/\/jobs\/view\/(\d+)/);
+  return match ? match[1] : 'Unknown';
+};
+
+const extractLocationPostingApplicants = () => {
+  let location = 'Not specified';
+  let whenPosted = 'Not specified';
+  let applicants = 'Not specified';
+
+  // Try composite info line first (parts separated by " · ")
+  const infoEl = extractElement(SELECTORS.infoLine);
+  const infoLine = infoEl?.textContent.trim();
+
+  if (infoLine?.includes(' · ')) {
+    const parts = infoLine.split(' · ').map(p => p.trim());
+    if (parts[0]) location = parts[0];
+    if (parts[1]) whenPosted = parts[1];
+    if (parts[2]) applicants = parts[2];
+  } else {
+    // Individual fallbacks
+    location = extractFieldWithTextScan(SELECTORS.location,
+      text => text.includes(',') || /[A-Z][a-z]+, [A-Z]{2}/.test(text));
+
+    whenPosted = extractFieldWithTextScan(SELECTORS.postingTime,
+      text => /ago|day|hour|week|month|posted/i.test(text));
+
+    applicants = extractFieldWithTextScan(SELECTORS.applicants,
+      text => /applicant|application|clicked apply/i.test(text));
+  }
+
+  return { location, whenPosted, applicants };
+};
+
+/**
+ * Try selectors, then fall back to scanning all spans by predicate.
+ */
+const extractFieldWithTextScan = (config, predicate, defaultValue = 'Not specified') => {
+  // Try CSS selectors
+  for (const selector of config.css) {
+    for (const el of document.querySelectorAll(selector)) {
+      const text = el.textContent.trim();
+      if (text && predicate(text)) {
+        return stripMatchesPref(text);
       }
     }
-    
-    return true; // Keep the message channel open for async response
-  });
-})();
-
-// Create and inject a floating download button on the page
-function injectDownloadButton() {
-  // Check if button already exists
-  if (document.getElementById('linkedin-job-downloader-button')) {
-    return;
   }
-  
-  // Create container
+  // Fallback: scan all spans
+  const result = scanByText('span', t => predicate(t));
+  return result ? stripMatchesPref(result) : defaultValue;
+};
+
+const stripMatchesPref = (text) =>
+  text.includes('Matches your job preferences')
+    ? text.split('Matches your job preferences')[0].trim()
+    : text;
+
+const extractSalaryWorkJobType = () => {
+  let salaryRange = 'Not specified';
+  let workType = 'Not specified';
+  let jobType = 'Not specified';
+
+  // Try composite insight line
+  const insightEl = extractElement(SELECTORS.insightLine);
+  let insightLine = insightEl?.textContent.trim() ?? '';
+  insightLine = stripMatchesPref(insightLine);
+
+  if (insightLine) {
+    // Parse salary
+    if (insightLine.includes('$') || insightLine.toLowerCase().includes('salary')) {
+      const match = insightLine.match(/\$[\d,.]+(\/|\s*-\s*\$|\s*to\s*\$|\s*per\s*|\s*\+|K\/)/i);
+      if (match) {
+        const start = insightLine.indexOf(match[0]);
+        let end = insightLine.length;
+        for (const marker of ['  ', ' Remote', ' Hybrid', ' On-site', ' Full-time', ' Part-time']) {
+          const pos = insightLine.indexOf(marker, start);
+          if (pos !== -1 && pos < end) end = pos;
+        }
+        salaryRange = insightLine.substring(start, end).trim();
+      }
+    }
+
+    // Parse work type
+    for (const kw of ['Remote', 'Hybrid', 'On-site', 'Onsite']) {
+      if (insightLine.includes(kw)) { workType = kw; break; }
+    }
+
+    // Parse job type
+    for (const kw of ['Full-time', 'Part-time', 'Contract', 'Temporary', 'Internship']) {
+      if (insightLine.includes(kw)) { jobType = kw; break; }
+    }
+  }
+
+  // Individual fallbacks
+  if (salaryRange === 'Not specified') {
+    salaryRange = extractFieldWithTextScan(SELECTORS.salary,
+      text => text.includes('$') || /salary|pay|compensation/i.test(text));
+  }
+  if (workType === 'Not specified') {
+    workType = extractFieldWithTextScan(SELECTORS.workType,
+      text => /remote|hybrid|on-site|onsite/i.test(text));
+  }
+  if (jobType === 'Not specified') {
+    jobType = extractFieldWithTextScan(SELECTORS.jobType,
+      text => /full-time|part-time|contract|temporary|internship/i.test(text));
+  }
+
+  return { salaryRange, workType, jobType };
+};
+
+const extractJobDescription = () => {
+  // Try configured selectors
+  const el = extractElement(SELECTORS.jobDescription);
+  if (el) return el.innerHTML;
+
+  // Fallback: look for "About the job" / "Job description" headers
+  for (const header of document.querySelectorAll('h2, h3')) {
+    if (/about the job|job description|description/i.test(header.textContent)) {
+      let parent = header.parentElement;
+      for (let i = 0; i < 3 && parent; i++) {
+        if (parent.innerHTML.length > 200) return parent.innerHTML;
+        parent = parent.parentElement;
+      }
+    }
+  }
+
+  return 'No job description available.';
+};
+
+const extractJobData = () => {
+  const { location, whenPosted, applicants } = extractLocationPostingApplicants();
+  const { salaryRange, workType, jobType } = extractSalaryWorkJobType();
+
+  return {
+    jobTitle: getJobTitle(),
+    companyName: getCompanyName(),
+    jobId: getJobId(),
+    url: window.location.href,
+    location,
+    whenPosted,
+    applicants,
+    salaryRange,
+    workType,
+    jobType,
+    jobDescription: extractJobDescription(),
+    timestamp: new Date().toISOString()
+  };
+};
+
+// ---------------------------------------------------------------------------
+// "See more" button handling with MutationObserver
+// ---------------------------------------------------------------------------
+
+const clickSeeMoreButton = () => {
+  // Try configured selectors first
+  for (const selector of SELECTORS.seeMoreButton.css) {
+    const btn = document.querySelector(selector);
+    if (btn?.offsetParent) {
+      log('Clicking See more button via selector');
+      btn.click();
+      return true;
+    }
+  }
+
+  // Fallback: scan all buttons by text
+  for (const btn of document.querySelectorAll('button')) {
+    const text = btn.textContent.toLowerCase();
+    if (btn.offsetParent && (text.includes('see more') || text.includes('show more'))) {
+      log('Clicking See more button via text scan');
+      btn.click();
+      return true;
+    }
+  }
+
+  return false;
+};
+
+const waitForAndClickSeeMore = () => {
+  if (clickSeeMoreButton()) return;
+
+  const observer = new MutationObserver((_mutations, obs) => {
+    if (clickSeeMoreButton()) obs.disconnect();
+  });
+
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  // Stop watching after 10 seconds
+  setTimeout(() => observer.disconnect(), 10_000);
+};
+
+// ---------------------------------------------------------------------------
+// Floating download button
+// ---------------------------------------------------------------------------
+
+const injectDownloadButton = () => {
+  if (document.getElementById('linkedin-job-downloader-button')) return;
+
   const container = document.createElement('div');
   container.id = 'linkedin-job-downloader-container';
   container.style.cssText = `
@@ -90,8 +376,7 @@ function injectDownloadButton() {
     z-index: 9999;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
   `;
-  
-  // Create button
+
   const button = document.createElement('button');
   button.id = 'linkedin-job-downloader-button';
   button.textContent = 'Download Job Description';
@@ -107,16 +392,10 @@ function injectDownloadButton() {
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
     transition: background-color 0.3s;
   `;
-  
-  // Add hover effect
-  button.onmouseover = function() {
-    this.style.backgroundColor = '#005582';
-  };
-  button.onmouseout = function() {
-    this.style.backgroundColor = '#0073b1';
-  };
-  
-  // Create status div (hidden initially)
+
+  button.onmouseover = () => { button.style.backgroundColor = '#005582'; };
+  button.onmouseout = () => { button.style.backgroundColor = '#0073b1'; };
+
   const status = document.createElement('div');
   status.id = 'linkedin-job-downloader-status';
   status.style.cssText = `
@@ -128,589 +407,114 @@ function injectDownloadButton() {
     text-align: center;
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
   `;
-  
-  // Add click handler
-  button.onclick = function() {
-    // Change button state
+
+  const showStatus = (message, type) => {
+    status.textContent = message;
+    status.style.display = 'block';
+    const colors = {
+      error: { bg: '#f8d7da', fg: '#721c24' },
+      success: { bg: '#d4edda', fg: '#155724' },
+      info: { bg: '#cce5ff', fg: '#004085' }
+    };
+    const c = colors[type] ?? colors.info;
+    status.style.backgroundColor = c.bg;
+    status.style.color = c.fg;
+  };
+
+  const resetButton = () => {
+    button.disabled = false;
+    button.textContent = 'Download Job Description';
+    button.style.backgroundColor = '#0073b1';
+    downloading = false;
+  };
+
+  let downloading = false;
+
+  button.onclick = () => {
+    if (downloading) return;
+    downloading = true;
     button.disabled = true;
     button.textContent = 'Downloading...';
     button.style.backgroundColor = '#999';
-    
-    // Show status
     showStatus('Getting job details...', 'info');
-    
+
     try {
-      // Extract job data
       const jobData = extractJobData();
-      
-      // Send to background script to create and download HTML
-      chrome.runtime.sendMessage({
-        action: "createAndDownloadHTML",
-        jobData: jobData
-      }, function(response) {
-        if (chrome.runtime.lastError) {
-          console.error("Error in background script:", chrome.runtime.lastError.message);
-          showStatus('Error: ' + chrome.runtime.lastError.message, 'error');
-          resetButton();
-          return;
-        }
-        
-        if (response && response.success) {
-          showStatus('Downloaded successfully!', 'success');
-          button.textContent = 'Downloaded!';
-          
-          // Reset button after 3 seconds
-          setTimeout(function() {
+
+      chrome.runtime.sendMessage(
+        { action: 'createAndDownloadHTML', jobData },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            console.error('Background script error:', chrome.runtime.lastError.message);
+            showStatus('Error: ' + chrome.runtime.lastError.message, 'error');
             resetButton();
-            hideStatus();
-          }, 3000);
-        } else {
-          showStatus('Error downloading file: ' + ((response && response.error) || 'Unknown error'), 'error');
-          resetButton();
+            return;
+          }
+
+          if (response?.success) {
+            showStatus('Downloaded successfully!', 'success');
+            button.textContent = 'Downloaded!';
+            setTimeout(() => {
+              resetButton();
+              status.style.display = 'none';
+            }, 3000);
+          } else {
+            showStatus('Error: ' + (response?.error ?? 'Unknown error'), 'error');
+            resetButton();
+          }
         }
-      });
-      
+      );
     } catch (error) {
-      console.error("Error downloading job:", error);
+      console.error('Error downloading job:', error);
       showStatus('Error: ' + error.message, 'error');
       resetButton();
     }
   };
-  
-  function resetButton() {
-    button.disabled = false;
-    button.textContent = 'Download Job Description';
-    button.style.backgroundColor = '#0073b1';
-  }
-  
-  function showStatus(message, type) {
-    status.textContent = message;
-    status.style.display = 'block';
-    
-    if (type === 'error') {
-      status.style.backgroundColor = '#f8d7da';
-      status.style.color = '#721c24';
-    } else if (type === 'success') {
-      status.style.backgroundColor = '#d4edda';
-      status.style.color = '#155724';
-    } else {
-      status.style.backgroundColor = '#cce5ff';
-      status.style.color = '#004085';
-    }
-  }
-  
-  function hideStatus() {
-    status.style.display = 'none';
-  }
-  
-  // Assemble and add to page
+
   container.appendChild(button);
   container.appendChild(status);
   document.body.appendChild(container);
-}
+};
 
-// Extract job data from the page
-function extractJobData() {
-  // Basic job information
-  const jobTitle = getJobTitle();
-  const companyName = getCompanyName();
-  const jobId = getJobId();
-  const url = window.location.href;
-  
-  // Get detailed job information
-  const locationPostingApplicants = extractLocationPostingApplicants();
-  const salaryWorkJobType = extractSalaryWorkJobType();
-  
-  // Job description
-  const jobDescription = extractJobDescription();
-  
-  // Combine all data
-  return {
-    jobTitle: jobTitle,
-    companyName: companyName,
-    jobId: jobId,
-    url: url,
-    location: locationPostingApplicants.location,
-    whenPosted: locationPostingApplicants.whenPosted,
-    applicants: locationPostingApplicants.applicants,
-    salaryRange: salaryWorkJobType.salaryRange,
-    workType: salaryWorkJobType.workType,
-    jobType: salaryWorkJobType.jobType,
-    jobDescription: jobDescription,
-    timestamp: new Date().toISOString()
-  };
-}
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
 
-// Get the job title
-function getJobTitle() {
-  const selectors = [
-    '.job-details-jobs-unified-top-card__job-title',
-    '.jobs-unified-top-card__job-title',
-    '.topcard__title',
-    'h1.t-24',
-    'h1'
-  ];
-  
-  for (const selector of selectors) {
-    const element = document.querySelector(selector);
-    if (element && element.textContent.trim()) {
-      return element.textContent.trim();
-    }
-  }
-  
-  return "Unknown Position";
-}
+log('LinkedIn Job Downloader initialized');
 
-// Get the company name
-function getCompanyName() {
-  const selectors = [
-    '.job-details-jobs-unified-top-card__company-name',
-    '.jobs-unified-top-card__company-name',
-    '.jobs-top-card__company-url',
-    '.topcard__org-name-link',
-    'a[data-tracking-control-name="public_jobs_topcard-org-name"]'
-  ];
-  
-  for (const selector of selectors) {
-    const element = document.querySelector(selector);
-    if (element && element.textContent.trim()) {
-      return element.textContent.trim();
-    }
-  }
-  
-  return "Unknown Company";
-}
+injectDownloadButton();
 
-// Get the job ID from the URL
-function getJobId() {
-  const match = window.location.href.match(/\/jobs\/view\/(\d+)/);
-  return match ? match[1] : "Unknown";
-}
+// Notify extension that we're on a job page
+chrome.runtime.sendMessage({
+  action: 'jobPageDetected',
+  jobTitle: getJobTitle(),
+  companyName: getCompanyName(),
+  url: window.location.href
+});
 
-// Extract location, posting time, and applicants information
-function extractLocationPostingApplicants() {
-  let location = "Not specified";
-  let whenPosted = "Not specified";
-  let applicants = "Not specified";
-  
-  // Try to find the info line
-  const infoLineSelectors = [
-    '.job-details-jobs-unified-top-card__primary-description-container',
-    '.jobs-unified-top-card__primary-description',
-    '.job-details-jobs-unified-top-card__subtitle-primary-grouping',
-    '.job-card-container__primary-description',
-    '.jobs-unified-top-card__subtitle-primary'
-  ];
-  
-  let infoLine = null;
-  for (const selector of infoLineSelectors) {
-    const element = document.querySelector(selector);
-    if (element) {
-      infoLine = element.textContent.trim();
-      if (infoLine.includes(" · ")) {
-        break;
-      }
-    }
-  }
-  
-  if (infoLine && infoLine.includes(" · ")) {
-    // Split the info line by the separator " · "
-    const parts = infoLine.split(" · ").map(part => part.trim());
-    
-    // First part is usually the location
-    if (parts.length >= 1) {
-      location = parts[0];
-    }
-    
-    // Second part is usually when it was posted
-    if (parts.length >= 2) {
-      whenPosted = parts[1];
-    }
-    
-    // Third part is usually the applicants count
-    if (parts.length >= 3) {
-      applicants = parts[2];
-    }
-  } else {
-    // Try individual selectors if info line not found
-    location = extractLocation();
-    whenPosted = extractPostingTime();
-    applicants = extractApplicantsInfo();
-  }
-  
-  return { location, whenPosted, applicants };
-}
+// Expand truncated job descriptions
+waitForAndClickSeeMore();
 
-// Extract location information
-function extractLocation() {
-  const locationSelectors = [
-    '.job-details-jobs-unified-top-card__bullet',
-    '.jobs-unified-top-card__bullet',
-    '.jobs-unified-top-card__subtitle-primary',
-    '.topcard__flavor',
-    '.topcard__flavor--bullet'
-  ];
-  
-  for (const selector of locationSelectors) {
-    const elements = document.querySelectorAll(selector);
-    for (const element of elements) {
-      const text = element.textContent.trim();
-      if (text && (text.includes(',') || text.match(/[A-Z][a-z]+, [A-Z]{2}/))) {
-        return text;
-      }
-    }
-  }
-  
-  return "Not specified";
-}
+// Listen for messages from popup or background
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  log('Received message:', request.action);
 
-// Extract posting time information
-function extractPostingTime() {
-  const timeSelectors = [
-    '.jobs-unified-top-card__subtitle-secondary-grouping span',
-    '.posted-time',
-    '.topcard__flavor--metadata',
-    '.job-posting-time',
-    '.job-details-jobs-unified-top-card__posted-date',
-    'span[data-tracking-control-name="public_jobs_posted-date"]'
-  ];
-  
-  for (const selector of timeSelectors) {
-    const elements = document.querySelectorAll(selector);
-    for (const element of elements) {
-      const text = element.textContent.trim();
-      if (text && (text.includes('ago') || text.includes('day') || text.includes('hour') ||
-                   text.includes('week') || text.includes('month') || text.includes('posted'))) {
-        return text;
-      }
+  if (request.action === 'ping') {
+    sendResponse({ pong: true });
+  } else if (request.action === 'getJobDetails') {
+    sendResponse({
+      success: true,
+      jobTitle: getJobTitle(),
+      companyName: getCompanyName()
+    });
+  } else if (request.action === 'downloadJob') {
+    try {
+      sendResponse({ success: true, jobData: extractJobData() });
+    } catch (error) {
+      console.error('Error extracting job data:', error);
+      sendResponse({ success: false, error: error.message });
     }
   }
-  
-  // Try finding any span with posting time keywords
-  const spans = document.querySelectorAll('span');
-  for (const span of spans) {
-    const text = span.textContent.trim().toLowerCase();
-    if ((text.includes('ago') || text.includes('day') || text.includes('hour') ||
-         text.includes('week') || text.includes('month') || text.includes('posted')) && 
-        text.length < 50) {
-      return span.textContent.trim();
-    }
-  }
-  
-  return "Not specified";
-}
 
-// Extract applicants information
-function extractApplicantsInfo() {
-  const applicantSelectors = [
-    '.jobs-unified-top-card__subtitle-secondary-grouping span',
-    '.applicants',
-    '.topcard__flavor--metadata',
-    'span.num-applicants',
-    '.jobs-unified-top-card__applicant-count',
-    '.jobs-details-jobs-unified-top-card__applicant-count'
-  ];
-  
-  for (const selector of applicantSelectors) {
-    const elements = document.querySelectorAll(selector);
-    for (const element of elements) {
-      const text = element.textContent.trim();
-      if (text && (text.includes('applicant') || text.includes('application') || 
-                   text.includes('clicked apply'))) {
-        return text;
-      }
-    }
-  }
-  
-  // Try finding any span with applicant keywords
-  const spans = document.querySelectorAll('span');
-  for (const span of spans) {
-    const text = span.textContent.trim().toLowerCase();
-    if ((text.includes('applicant') || text.includes('application') || 
-         text.includes('clicked apply')) && text.length < 70) {
-      return span.textContent.trim();
-    }
-  }
-  
-  return "Not specified";
-}
-
-// Extract salary, work type, and job type
-function extractSalaryWorkJobType() {
-  let salaryRange = "Not specified";
-  let workType = "Not specified";
-  let jobType = "Not specified";
-  
-  // Try to find the insight line
-  const insightLineSelectors = [
-    '.job-details-jobs-unified-top-card__job-insight-container',
-    '.jobs-unified-top-card__job-insight',
-    '.job-details-jobs-unified-top-card__workplace-type',
-    '.job-card-container__metadata-item',
-    '.jobs-unified-top-card__job-insight-container'
-  ];
-  
-  let insightLine = null;
-  for (const selector of insightLineSelectors) {
-    const element = document.querySelector(selector);
-    if (element) {
-      insightLine = element.textContent.trim();
-      if (insightLine.includes("Matches your job preferences")) {
-        insightLine = insightLine.split("Matches your job preferences")[0].trim();
-      }
-      break;
-    }
-  }
-  
-  if (insightLine) {
-    // Parse salary range
-    if (insightLine.includes('$') || insightLine.toLowerCase().includes('salary')) {
-      const salaryPattern = /\$[\d,.]+(\/|\s*-\s*\$|\s*to\s*\$|\s*per\s*|\s*\+|K\/)/i;
-      const match = insightLine.match(salaryPattern);
-      if (match) {
-        const salaryStart = insightLine.indexOf(match[0]);
-        let salaryEnd = insightLine.length;
-        
-        const markers = ["  ", " Remote", " Hybrid", " On-site", " Full-time", " Part-time"];
-        for (const marker of markers) {
-          const pos = insightLine.indexOf(marker, salaryStart);
-          if (pos !== -1 && pos < salaryEnd) {
-            salaryEnd = pos;
-          }
-        }
-        
-        salaryRange = insightLine.substring(salaryStart, salaryEnd).trim();
-      }
-    }
-    
-    // Parse work type
-    const workTypeKeywords = ['Remote', 'Hybrid', 'On-site', 'Onsite'];
-    for (const keyword of workTypeKeywords) {
-      if (insightLine.includes(keyword)) {
-        workType = keyword;
-        break;
-      }
-    }
-    
-    // Parse job type
-    const jobTypeKeywords = ['Full-time', 'Part-time', 'Contract', 'Temporary', 'Internship'];
-    for (const keyword of jobTypeKeywords) {
-      if (insightLine.includes(keyword)) {
-        jobType = keyword;
-        break;
-      }
-    }
-  }
-  
-  // Try individual elements if insight line parsing failed
-  if (salaryRange === "Not specified") {
-    salaryRange = extractSalaryRange();
-  }
-  
-  if (workType === "Not specified") {
-    workType = extractWorkType();
-  }
-  
-  if (jobType === "Not specified") {
-    jobType = extractJobType();
-  }
-  
-  return { salaryRange, workType, jobType };
-}
-
-// Extract salary range
-function extractSalaryRange() {
-  const salarySelectors = [
-    '.job-details-jobs-unified-top-card__job-insight span',
-    '.jobs-unified-top-card__job-insight span',
-    '.salary-information',
-    '.compensation',
-    '.job-details-jobs-unified-top-card__job-insight-container'
-  ];
-  
-  for (const selector of salarySelectors) {
-    const elements = document.querySelectorAll(selector);
-    for (const element of elements) {
-      const text = element.textContent.trim();
-      if (text && (text.includes('$') || text.toLowerCase().includes('salary') ||
-                 text.toLowerCase().includes('pay') || text.toLowerCase().includes('compensation'))) {
-        if (text.includes("Matches your job preferences")) {
-          return text.split("Matches your job preferences")[0].trim();
-        }
-        return text;
-      }
-    }
-  }
-  
-  // Try any span with $ sign
-  const spans = document.querySelectorAll('span');
-  for (const span of spans) {
-    const text = span.textContent.trim();
-    if (text.includes('$') && text.length < 100) {
-      if (text.includes("Matches your job preferences")) {
-        return text.split("Matches your job preferences")[0].trim();
-      }
-      return text;
-    }
-  }
-  
-  return "Not specified";
-}
-
-// Extract work type
-function extractWorkType() {
-  const workTypeSelectors = [
-    '.job-details-jobs-unified-top-card__workplace-type',
-    '.jobs-unified-top-card__workplace-type',
-    '.workplace-type',
-    'span.job-details-jobs-unified-top-card__workplace-type',
-    'span[data-tracking-control-name="workplace_type"]'
-  ];
-  
-  for (const selector of workTypeSelectors) {
-    const elements = document.querySelectorAll(selector);
-    for (const element of elements) {
-      const text = element.textContent.trim();
-      if (text && (text.toLowerCase().includes('remote') || text.toLowerCase().includes('hybrid') ||
-                 text.toLowerCase().includes('on-site') || text.toLowerCase().includes('onsite'))) {
-        if (text.includes("Matches your job preferences")) {
-          return text.split("Matches your job preferences")[0].trim();
-        }
-        return text;
-      }
-    }
-  }
-  
-  // Try any span with work type keywords
-  const spans = document.querySelectorAll('span');
-  for (const span of spans) {
-    const text = span.textContent.trim().toLowerCase();
-    if ((text.includes('remote') || text.includes('hybrid') || 
-         text.includes('on-site') || text.includes('onsite')) && text.length < 50) {
-      const originalText = span.textContent.trim();
-      if (originalText.includes("Matches your job preferences")) {
-        return originalText.split("Matches your job preferences")[0].trim();
-      }
-      return originalText;
-    }
-  }
-  
-  return "Not specified";
-}
-
-// Extract job type
-function extractJobType() {
-  const jobTypeSelectors = [
-    '.job-details-jobs-unified-top-card__job-type',
-    '.jobs-unified-top-card__job-type',
-    'span[data-tracking-control-name="job_type"]'
-  ];
-  
-  for (const selector of jobTypeSelectors) {
-    const elements = document.querySelectorAll(selector);
-    for (const element of elements) {
-      const text = element.textContent.trim();
-      if (text && (text.toLowerCase().includes('full-time') || text.toLowerCase().includes('part-time') || 
-                  text.toLowerCase().includes('contract') || text.toLowerCase().includes('temporary') ||
-                  text.toLowerCase().includes('internship'))) {
-        if (text.includes("Matches your job preferences")) {
-          return text.split("Matches your job preferences")[0].trim();
-        }
-        return text;
-      }
-    }
-  }
-  
-  // Try any span with job type keywords
-  const spans = document.querySelectorAll('span');
-  for (const span of spans) {
-    const text = span.textContent.trim().toLowerCase();
-    if ((text.includes('full-time') || text.includes('part-time') || 
-         text.includes('contract') || text.includes('temporary') ||
-         text.includes('internship')) && text.length < 50) {
-      const originalText = span.textContent.trim();
-      if (originalText.includes("Matches your job preferences")) {
-        return originalText.split("Matches your job preferences")[0].trim();
-      }
-      return originalText;
-    }
-  }
-  
-  return "Not specified";
-}
-
-// Click the "See more" button to expand job description
-function clickSeeMoreButton() {
-  const seeMoreSelectors = [
-    'button.jobs-description__footer-button',
-    'button.jobs-description__see-more-button',
-    'button.show-more-less-html__button',
-    'button.show-more-less-html__button--more',
-    'button.artdeco-button.artdeco-button--muted',
-    "button[aria-label='Click to see more description']"
-  ];
-  
-  for (const selector of seeMoreSelectors) {
-    const buttons = document.querySelectorAll(selector);
-    for (const button of buttons) {
-      if (button.offsetParent !== null && 
-          (button.textContent.toLowerCase().includes('see more') || 
-           button.textContent.toLowerCase().includes('show more'))) {
-        console.log("Clicking 'See more' button");
-        button.click();
-        return true;
-      }
-    }
-  }
-  
-  // Try a more general approach
-  const allButtons = document.querySelectorAll('button');
-  for (const button of allButtons) {
-    if (button.offsetParent !== null && 
-        (button.textContent.toLowerCase().includes('see more') || 
-         button.textContent.toLowerCase().includes('show more'))) {
-      console.log("Clicking 'See more' button (general method)");
-      button.click();
-      return true;
-    }
-  }
-  
-  console.log("No 'See more' button found");
-  return false;
-}
-
-// Extract job description
-function extractJobDescription() {
-  const descriptionSelectors = [
-    '.jobs-description__content',
-    '.jobs-description-content',
-    '#job-details',
-    '.jobs-box__html-content',
-    '.description__text'
-  ];
-  
-  for (const selector of descriptionSelectors) {
-    const element = document.querySelector(selector);
-    if (element) {
-      return element.innerHTML;
-    }
-  }
-  
-  // Try looking for "About the job" section
-  const headers = document.querySelectorAll('h2, h3');
-  for (const header of headers) {
-    if (header.textContent.includes('About the job') || 
-        header.textContent.includes('Job description') ||
-        header.textContent.includes('Description')) {
-      let parent = header.parentElement;
-      for (let i = 0; i < 3; i++) {
-        if (parent && parent.innerHTML.length > 200) {
-          return parent.innerHTML;
-        }
-        parent = parent.parentElement;
-      }
-    }
-  }
-  
-  return "No job description available.";
-}
+  return true;
+});
